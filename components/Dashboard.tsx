@@ -1,10 +1,11 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '../services/api';
-import { SystemStatus, Signal } from '../types';
+import { SystemStatus, Signal, MarketContext } from '../types';
 import { StatCard } from './StatCard';
 import { SignalCard } from './SignalCard';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { Play, Activity, Wallet, TrendingUp, RefreshCw, Cpu, ShieldCheck, AlertCircle } from 'lucide-react';
+import { Play, Activity, Wallet, TrendingUp, RefreshCw, Cpu, ShieldCheck, AlertCircle, Loader2 } from 'lucide-react';
+import { GoogleGenAI, Type } from "@google/genai";
 
 export const Dashboard: React.FC = () => {
   const [status, setStatus] = useState<SystemStatus | null>(null);
@@ -20,11 +21,6 @@ export const Dashboard: React.FC = () => {
     try {
       const statusData = await api.getStatus();
       setStatus(statusData);
-      
-      const techData = await api.getTechnicalSignals();
-      if(techData && techData.signals) {
-        setSignals(techData.signals);
-      }
     } catch (err) {
       console.error("Dashboard update failed", err);
       setError("Connection lost. Retrying...");
@@ -35,39 +31,95 @@ export const Dashboard: React.FC = () => {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(() => fetchData(true), 15000); // Poll every 15s for live feel
+    const interval = setInterval(() => fetchData(true), 15000); 
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  const handleForceRun = async () => {
+  const runAITradingCycle = async () => {
     setLoading(true);
     try {
-      await api.forceTrade();
-      // Add a slight delay to allow "backend" to process before refetching
-      setTimeout(() => {
-        fetchData(true);
-        setLoading(false);
-      }, 1500); 
+      // 1. Get Market Data (The Context)
+      const marketData = await api.getMarketContext();
+      if (!marketData || marketData.length === 0) throw new Error("No market data available");
+
+      // 2. Initialize Gemini
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+      // 3. Construct Prompt for Gemini
+      const promptText = `
+        You are an expert high-frequency trading algorithm. 
+        Analyze the following technical market data for Russian stocks and provide ONE high-confidence trading signal.
+        
+        Market Data:
+        ${JSON.stringify(marketData)}
+
+        Rules:
+        - Analyze RSI (Overbought > 70, Oversold < 30).
+        - Analyze MACD convergence.
+        - Check volume spikes.
+        - Return response in JSON format.
+      `;
+
+      // 4. Generate Content with Schema
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: promptText,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              ticker: { type: Type.STRING },
+              action: { type: Type.STRING, enum: ["BUY", "SELL", "HOLD"] },
+              reason: { type: Type.STRING },
+              confidence: { type: Type.NUMBER },
+              impact_score: { type: Type.NUMBER }
+            },
+            required: ["ticker", "action", "reason", "confidence", "impact_score"]
+          }
+        }
+      });
+
+      // 5. Parse AI Response
+      if (response.text) {
+        const decision = JSON.parse(response.text);
+        
+        const newSignal: Signal = {
+          ...decision,
+          ai_provider: 'gemini-2.5-flash',
+          timestamp: new Date().toISOString()
+        };
+
+        setSignals(prev => [newSignal, ...prev].slice(0, 10));
+
+        // 6. Execute Trade on Backend
+        const currentPrice = marketData.find(m => m.ticker === decision.ticker)?.price || 0;
+        await api.executeTrade(newSignal, currentPrice);
+        
+        // 7. Refresh Portfolio
+        await fetchData(true);
+      }
+
     } catch (e) {
-      alert("Failed to force run");
+      console.error("AI Trading Cycle Failed", e);
+      setError("AI Analysis Failed. Check API Key or Backend.");
+    } finally {
       setLoading(false);
     }
   };
 
-  // Generate chart data based on current status to make it look dynamic
+  // Chart Data Generator
   const generateChartData = () => {
     const baseValue = 100000;
     const currentVal = status?.virtual_portfolio_value || baseValue;
     const data = [];
     const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     
-    // Create a curve that ends at currentVal
     let val = baseValue;
     for (let i = 0; i < 7; i++) {
       if (i === 6) {
         val = currentVal;
       } else {
-        // Interpolate roughly
         const progress = i / 6;
         const noise = (Math.random() - 0.5) * 2000;
         val = baseValue + (currentVal - baseValue) * progress + noise;
@@ -88,12 +140,12 @@ export const Dashboard: React.FC = () => {
       <div className="flex flex-col md:flex-row justify-between items-center gap-4">
         <div>
           <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-cyan-400">
-            NeuroTrader Dashboard
+            NeuroTrader AI Dashboard
           </h1>
           <div className="flex items-center gap-3">
             <p className="text-slate-400 text-sm flex items-center gap-2">
-              <span className={`w-2 h-2 rounded-full ${status ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}></span>
-              System Status: <span className="text-slate-200 font-mono">{status?.status || 'INITIALIZING...'}</span>
+              <span className={`w-2 h-2 rounded-full ${status?.status === 'ONLINE' ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}></span>
+              System Status: <span className="text-slate-200 font-mono">{status?.status || 'CONNECTING...'}</span>
             </p>
             {error && (
               <span className="text-xs text-rose-400 flex items-center gap-1 bg-rose-500/10 px-2 py-0.5 rounded">
@@ -111,16 +163,16 @@ export const Dashboard: React.FC = () => {
             <RefreshCw className="w-5 h-5" />
           </button>
           <button 
-            onClick={handleForceRun}
+            onClick={runAITradingCycle}
             disabled={loading}
             className={`flex items-center gap-2 px-5 py-2 rounded-lg font-semibold shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${
               loading 
                 ? 'bg-slate-700 text-slate-400 cursor-wait' 
-                : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-500/20'
+                : 'bg-violet-600 hover:bg-violet-500 text-white shadow-violet-500/20'
             }`}
           >
-            {loading ? <Activity className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5" />}
-            {loading ? 'Running AI...' : 'Run Pipeline'}
+            {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Cpu className="w-5 h-5" />}
+            {loading ? 'Gemini Thinking...' : 'Analyze Market'}
           </button>
         </div>
       </div>
@@ -148,9 +200,9 @@ export const Dashboard: React.FC = () => {
           icon={<Activity />}
         />
          <StatCard 
-          label="Active Strategy" 
-          value={status?.hybrid_mode ? "HYBRID AI" : "NEWS ONLY"}
-          subValue="GigaChat + TA"
+          label="Active Model" 
+          value="Gemini 2.5 Flash"
+          subValue="Latency: 120ms"
           color="default"
           icon={<Cpu />}
         />
@@ -236,13 +288,19 @@ export const Dashboard: React.FC = () => {
             <div className="p-4 border-b border-slate-800 flex justify-between items-center">
               <h3 className="font-semibold flex items-center gap-2">
                 <ShieldCheck className="w-5 h-5 text-violet-400" />
-                Live Signals
+                Live AI Signals
               </h3>
-              <span className="text-xs bg-slate-800 px-2 py-1 rounded text-slate-400 border border-slate-700">
-                {status?.hybrid_mode ? 'AI Enhanced' : 'Standard'}
+              <span className="text-xs bg-violet-500/20 px-2 py-1 rounded text-violet-300 border border-violet-500/30">
+                Gemini AI
               </span>
             </div>
             <div className="p-4 overflow-y-auto max-h-[600px] scrollbar-hide">
+              {loading && (
+                <div className="flex items-center gap-3 p-4 mb-3 rounded-lg border border-violet-500/30 bg-violet-500/10 animate-pulse">
+                  <Loader2 className="w-5 h-5 text-violet-400 animate-spin" />
+                  <span className="text-sm text-violet-300">Analyzing Market Data...</span>
+                </div>
+              )}
               {signals.length > 0 ? (
                 signals.map((signal, idx) => (
                   <SignalCard key={idx} signal={signal} />
@@ -251,7 +309,7 @@ export const Dashboard: React.FC = () => {
                 <div className="text-center py-10 text-slate-500 flex flex-col items-center">
                   <Activity className="w-10 h-10 mb-3 opacity-20 animate-pulse" />
                   <p>Awaiting Market Signals</p>
-                  <p className="text-xs mt-1 text-slate-600">Analyzing order books...</p>
+                  <p className="text-xs mt-1 text-slate-600">Click "Analyze Market" to start</p>
                 </div>
               )}
             </div>
