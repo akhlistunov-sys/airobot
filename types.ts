@@ -10,6 +10,17 @@ export interface Trade {
   strategy?: string;
 }
 
+export interface MarketContext {
+  ticker: string;
+  price: number;
+  indicators: {
+    rsi: number;
+    macd: number;
+    volume_spike: boolean;
+    trend: string;
+  };
+}
+
 export interface Signal {
   action: 'BUY' | 'SELL' | 'HOLD';
   ticker: string;
@@ -17,7 +28,7 @@ export interface Signal {
   confidence: number;
   impact_score: number;
   event_type?: string;
-  ai_provider: string; // 'gigachat' | 'technical' | 'enhanced'
+  ai_provider: string; // 'gemini-2.5-flash' | 'gigachat' | 'technical'
   timestamp: string;
 }
 
